@@ -1,0 +1,199 @@
+#include <Wire.h>   //Comunicación I2C
+#include "MAX30105.h"           // Librería de SparkFun
+#include "heartRate.h"          // Función para calcular el BPM
+#include <Adafruit_GFX.h>       // Librería para la pantalla
+#include <Adafruit_SSD1306.h>   // Driver para la OLED
+
+
+// Tamaño de la OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Sensor
+MAX30105 particleSensor;
+
+// Definición de las variables para el promedio de pulso 
+const byte RATE_SIZE = 4; 
+byte rates[RATE_SIZE]; 
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute;
+int beatAvg = 0;
+
+// --- VARIABLES PARA OXIGENACIÓN (SpO2) ---
+double oxygen = 95;  // Valor inicial por defecto
+
+// Configuracion de sensor de respiracion
+const int pinSensor = 34;
+const int pinAlarma = 2;
+
+const float Vref = 3.3;
+const int umbralAlto = 2770;
+const int umbralBajo = 2600;
+
+int contadorEventos = 0;
+int eventosNecesarios =5;
+bool estadoVariante = false;
+
+bool ledEncendido = false;
+unsigned long tiempoInicioLED = 0;
+
+const unsigned long tiempoEncendido = 3000;
+
+// Pin DAC para la parte analógica del comparador 
+#define PIN_DAC_ALARMA 25 
+#define PIN_DAC_OXIGENO 26
+
+void setup() {
+    Serial.begin(115200);
+
+    // Resolucion ADC
+    analogReadResolution(12);
+    //Medicion hasta 3.3
+    analogSetAttenuation(ADC_11db);
+    pinMode(pinAlarma, OUTPUT);
+
+    delay(100);
+    Serial.println("Iniciando lectura...");
+
+    // Se inicia la dirección 0x3C para la pantalla OLED
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+        for(;;);
+    }
+    
+    // Inicialización para el sensor MAX30102
+    if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        while(1);
+    }
+
+    // --- CONFIGURACIÓN DE ALTA SENSIBILIDAD --- PULSO Y OXÍGENO
+    // Se deben de ajustar los registros del sensor para que detecte mejor a través del dedo
+    byte ledBrightness = 0x1F; // Se aumenta el brillo del LED
+    byte sampleAverage = 4;    // Promedio de muestras para suavizar ruido
+    byte ledMode = 2;          // Modo Red + IR
+    int sampleRate = 400;      // Velocidad de muestreo alta
+    int pulseWidth = 411;      // Ancho de pulso para mejor resolución
+    int adcRange = 4096;       // Rango del ADC
+
+    // Se le aplica la configuración anterior al sensor
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+}
+
+void loop() {
+  //Promedio para estabilidad
+  int voltaje = analogReadMilliVolts(pinSensor);
+  Serial.print("Voltaje : ");
+  Serial.print(voltaje);
+  Serial.println(" mV");
+
+  if (!ledEncendido){
+    if (voltaje>umbralAlto && !estadoVariante){
+      estadoVariante = true;
+    }
+    if (voltaje<umbralBajo && estadoVariante){
+      contadorEventos++;
+      estadoVariante = false;
+
+      Serial.print("Evento: ");
+      Serial.println(contadorEventos);
+    }
+    if (contadorEventos>= eventosNecesarios){
+      digitalWrite(pinAlarma, HIGH);
+      ledEncendido = true;
+      tiempoInicioLED = millis();
+      Serial.println("LED Encendido, ALARMA");
+    }
+  }
+  if (ledEncendido){
+    if(millis() - tiempoInicioLED>= tiempoEncendido){
+      digitalWrite(pinAlarma, LOW);
+      ledEncendido = false;
+      contadorEventos = 0;
+      estadoVariante = false;
+      Serial.println("LED Apagado, contador reiniciado");
+      delay(10);
+    }
+  }
+
+
+  //2. Lectura del LED infrarrojo
+    long irValue = particleSensor.getIR();
+    long redValue = particleSensor.getRed();
+
+    // Ahora usamos 20,000 como umbral mínimo para detectar que hay un dedo
+    if (irValue > 20000) { 
+    // Si detecta latido, calculamos todo
+    if (checkForBeat(irValue) == true) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        beatAvg = 0;
+        for (byte x = 0 ; x < RATE_SIZE ; x++) beatAvg += rates[x];
+        beatAvg /= RATE_SIZE;
+      }
+
+      // Solo calculamos oxígeno cuando hay un latido para mayor precisión
+      float ratio = (float)redValue / (float)irValue;
+      double currentSpO2 = -45.06 * ratio * ratio + 30.354 * ratio + 94.845;
+      
+      if (currentSpO2 > 70 && currentSpO2 <= 100) {
+        oxygen = 0.9 * oxygen + 0.1 * currentSpO2;
+      }
+    }
+  }
+
+    //  ALARMA ANALÓGICA - Comparador
+    // Si el pulso es bajo (menor a 60) se baja el voltaje del DAC
+    if (irValue > 20000 && beatAvg > 10 && beatAvg < 60) {
+        dacWrite(PIN_DAC_ALARMA, 50); // Salida de 0.6 V activa la alarma
+    } else {
+        dacWrite(PIN_DAC_ALARMA, 220); // Salida de 2.8 apaga la alarma
+    }
+
+    // Alarma Oxígeno (Pin 26 opcional para tu otro comparador)
+    if (irValue > 20000 && oxygen < 90) {
+        dacWrite(PIN_DAC_OXIGENO, 50); // Alarma si oxigenación es baja
+    } else {
+        dacWrite(PIN_DAC_OXIGENO, 220);
+    }
+
+    // --- DISEÑO OLED ---
+    static unsigned long ultimaPantalla = 0;
+    if (millis() - ultimaPantalla > 200) { // Actualizar cada 200ms
+        ultimaPantalla = millis();
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println("MONITOR UVG");
+        display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+        if (irValue < 20000) {
+            display.setCursor(20, 30);
+            display.print("ESPERANDO DEDO");
+            beatAvg = 0;
+        } else {
+            display.setCursor(5, 15);
+            display.print("PULSO:");
+            display.setCursor(5, 25);
+            display.setTextSize(2);
+            display.print(beatAvg);
+            display.setTextSize(1);
+            display.print(" BPM");
+
+            display.setCursor(5, 45);
+            display.print("OXIGENO:");
+            display.setCursor(65, 45);
+            display.setTextSize(2);
+            display.print((int)oxygen);
+            display.setTextSize(1);
+            display.print(" %");
+        }
+      display.display();
+    }
+}
