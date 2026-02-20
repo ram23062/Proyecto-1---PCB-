@@ -1,0 +1,179 @@
+#include <Wire.h>   //Comunicación I2C
+#include "MAX30105.h"           // Librería de SparkFun
+#include "heartRate.h"          // Función para calcular el BPM
+#include <Adafruit_GFX.h>       // Librería para la pantalla
+#include <Adafruit_SSD1306.h>   // Driver para la OLED
+
+
+// Tamaño de la OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Sensor
+MAX30105 particleSensor;
+
+// Definición de las variables para el promedio de pulso 
+const byte RATE_SIZE = 4; 
+byte rates[RATE_SIZE]; 
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute;
+int beatAvg = 0;
+
+// Configuracion de sensor de respiracion
+const int pinSensor = 34;
+const int pinAlarma = 2;
+
+const float Vref = 3.3;
+const int umbralAlto = 2770;
+const int umbralBajo = 2600;
+
+int contadorEventos = 0;
+int eventosNecesarios =5;
+bool estadoVariante = false;
+
+bool ledEncendido = false;
+unsigned long tiempoInicioLED = 0;
+
+const unsigned long tiempoEncendido = 3000;
+
+// Pin DAC para la parte analógica del comparador 
+#define PIN_DAC_ALARMA 25 
+
+void setup() {
+    Serial.begin(115200);
+
+    // Resolucion ADC
+    analogReadResolution(12);
+    //Medicion hasta 3.3
+    analogSetAttenuation(ADC_11db);
+    pinMode(pinAlarma, OUTPUT);
+
+    delay(1000);
+    Serial.println("Iniciando lectura...");
+
+    // Se inicia la dirección 0x3C para la pantalla OLED
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+        for(;;);
+    }
+    
+    // Inicialización para el sensor MAX30102
+    if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        while(1);
+    }
+
+    // --- CONFIGURACIÓN DE ALTA SENSIBILIDAD ---
+    // Se deben de ajustar los registros del sensor para que detecte mejor a través del dedo
+    byte ledBrightness = 0x1F; // Se aumenta el brillo del LED
+    byte sampleAverage = 4;    // Promedio de muestras para suavizar ruido
+    byte ledMode = 2;          // Modo Red + IR
+    int sampleRate = 400;      // Velocidad de muestreo alta
+    int pulseWidth = 411;      // Ancho de pulso para mejor resolución
+    int adcRange = 4096;       // Rango del ADC
+
+    // Se le aplica la configuración anterior al sensor
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+}
+
+void loop() {
+  //Promedio para estabilidad
+  int suma =0;
+  for (int i=0; i<10; i++){
+    suma+= analogReadMilliVolts(pinSensor);
+    delay(5);
+  }
+  int voltaje = suma /10;
+  Serial.print("Voltaje : ");
+  Serial.print(voltaje);
+  Serial.println(" mV");
+
+  if (!ledEncendido){
+    if (voltaje>umbralAlto && !estadoVariante){
+      estadoVariante = true;
+    }
+    if (voltaje<umbralBajo && estadoVariante){
+      contadorEventos++;
+      estadoVariante = false;
+
+      Serial.print("Evento: ");
+      Serial.println(contadorEventos);
+    }
+    if (contadorEventos>= eventosNecesarios){
+      digitalWrite(pinAlarma, HIGH);
+      ledEncendido = true;
+      tiempoInicioLED = millis();
+      Serial.println("LED Encendido, ALARMA");
+    }
+  }
+  if (ledEncendido){
+    if(millis() - tiempoInicioLED>= tiempoEncendido){
+      digitalWrite(pinAlarma, LOW);
+      ledEncendido = false;
+      contadorEventos = 0;
+      estadoVariante = false;
+      Serial.println("LED Apagado, contador reiniciado");
+    }
+  }
+
+  delay(500);
+
+  // Se lee el valor del LED infrarrojo
+    long irValue = particleSensor.getIR();
+
+    // Ahora usamos 20,000 como umbral mínimo para detectar que hay un dedo
+    if (irValue > 20000) { 
+        if (checkForBeat(irValue) == true) {
+            long delta = millis() - lastBeat; // Se calcula el tiempo entre latidos
+            lastBeat = millis();
+            beatsPerMinute = 60 / (delta / 1000.0); // Se calcula en frecuencia
+
+            // Aquí se evalua si el pulso proviene de un humano
+            if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+                rates[rateSpot++] = (byte)beatsPerMinute;
+                rateSpot %= RATE_SIZE;
+                // Se calcula el promedio de los últimos 4 latidos
+                beatAvg = 0;
+                for (byte x = 0 ; x < RATE_SIZE ; x++) beatAvg += rates[x];
+                beatAvg /= RATE_SIZE;
+            }
+        }
+    }
+
+    //  ALARMA ANALÓGICA - Comparador
+    // Si el pulso es bajo (menor a 60) se baja el voltaje del DAC
+    if (irValue > 20000 && beatAvg > 10 && beatAvg < 60) {
+        dacWrite(PIN_DAC_ALARMA, 50); // Salida de 0.6 V activa la alarma
+    } else {
+        dacWrite(PIN_DAC_ALARMA, 220); // Salida de 2.8 apaga la alarma
+    }
+
+    // --- DISEÑO OLED ---
+    display.clearDisplay(); // Se limpia antes de escribir
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("MONITOR UVG"); // Título del proyecto
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE); // Línea por estética
+
+    if (irValue < 20000) {
+      // Si no detecta el dedo, avisa
+        display.setCursor(20, 30);
+        display.print("ESPERANDO DEDO");
+        beatAvg = 0;
+    } else {
+      // Si hay lectura entonces se muestra el promedio
+        display.setCursor(10, 20);
+        display.print("PULSO:");
+        display.setCursor(10, 35);
+        display.setTextSize(3);
+        display.print(beatAvg);
+        display.setTextSize(1);
+        display.print(" BPM");
+
+        // Barra de pulso dinámica
+        int barWidth = map(irValue, 25000, 35000, 0, 128);
+        display.fillRect(0, 60, barWidth, 4, SSD1306_WHITE);
+    }
+    display.display();
+}
